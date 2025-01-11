@@ -1,165 +1,303 @@
-import os
+import time
+import json
+import pickle
+import asyncio
+import hashlib
 import threading
-from typing import Any, Dict, List, Optional, Union
+import logging
+import zlib
+import msgpack
+import ujson
+import heapq
+import sys
+import array
+import bisect
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict, Counter, deque
+from typing import Any, Dict, List, Set, Optional, Union, Tuple, Callable, Generator, AsyncIterator
+from threading import Lock, RLock
+from datetime import datetime, timedelta
 from contextlib import contextmanager
-from datetime import datetime
+from functools import lru_cache, wraps
+import mmh3  # Мурмур хеш - быстрее встроенного hash
+from sortedcontainers import SortedDict, SortedList  # Для эффективной сортировки
+import xxhash  # Ещё более быстрый хеш
+
+# Оптимизированные структуры данных
+@dataclass(slots=True)  # slots для уменьшения потребления памяти
+class CacheEntry:
+    value: Any
+    expire_time: Optional[float]
+    hits: int = 0
+    last_access: float = time.time()
+
+@dataclass(slots=True)
+class QueueItem:
+    priority: int
+    data: Any
+    timestamp: float = time.time()
+
+class OptimizedSet:
+    """Оптимизированное множество с быстрым поиском"""
+    def __init__(self):
+        self._data = array.array('Q')  # Используем array для экономии памяти
+        self._hash_func = xxhash.xxh64()  # Быстрая хеш-функция
+
+    def add(self, item: Any) -> None:
+        h = self._hash_func.update(str(item).encode()).intdigest()
+        if h not in self._data:
+            bisect.insort(self._data, h)
+
+    def remove(self, item: Any) -> None:
+        h = self._hash_func.update(str(item).encode()).intdigest()
+        idx = bisect.bisect_left(self._data, h)
+        if idx < len(self._data) and self._data[idx] == h:
+            self._data.pop(idx)
+
+    def __contains__(self, item: Any) -> bool:
+        h = self._hash_func.update(str(item).encode()).intdigest()
+        idx = bisect.bisect_left(self._data, h)
+        return idx < len(self._data) and self._data[idx] == h
 
 class FastMemory:
-    def __init__(self, folder: str, filename: str):
-        """
-        Инициализация FastMemory.
+    def __init__(self, 
+                 persistence_path: Optional[str] = None,
+                 max_memory: Optional[int] = None,
+                 auto_cleanup: bool = True,
+                 backup_interval: int = 3600,
+                 log_level: str = 'INFO',
+                 cluster_mode: bool = False,
+                 compression: bool = False,
+                 max_connections: int = 100,
+                 cache_policy: str = 'lru',
+                 max_cache_size: int = 1000,
+                 optimize_level: int = 2):  # Новый параметр для уровня оптимизации
+
+        # Оптимизированные структуры данных
+        self._storage = SortedDict()  # Быстрый доступ и сортировка
+        self._lists = defaultdict(deque)  # deque вместо list для O(1) вставки/удаления
+        self._sets = defaultdict(OptimizedSet)  # Оптимизированные множества
+        self._hashes = defaultdict(dict)
+        self._sorted_sets = defaultdict(SortedList)  # Эффективная сортировка
         
-        Args:
-            folder (str): Путь к папке для хранения данных
-            filename (str): Имя файла для хранения данных
-        """
-        self.filename = os.path.join(folder, filename)
-        self.lock = threading.Lock()
-        os.makedirs(folder, exist_ok=True)
-        self.data: Dict[str, dict] = self.load()
-
-    @classmethod
-    def new(cls, folder_path: str, file_name: str) -> 'FastMemory':
-        """
-        Создает новый экземпляр FastMemory с заданным путем и именем файла.
-        """
-        instance = cls(folder_path, file_name)
-        instance.save()
-        return instance
-
-    def load(self) -> Dict[str, Any]:
-        """Читает данные из файла и возвращает их в виде словаря."""
-        if not os.path.exists(self.filename):
-            return {}
+        # Оптимизированные индексы
+        self._indexes = defaultdict(lambda: SortedDict())
+        self._reverse_indexes = defaultdict(set)
         
-        with self.lock:
-            data = {}
-            try:
-                with open(self.filename, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if '=' in line:
-                            key, value = line.strip().split('=', 1)
-                            # Проверяем TTL если он есть
-                            if '||' in value:
-                                val, expires = value.split('||')
-                                if float(expires) > datetime.now().timestamp():
-                                    data[key] = {
-                                        'value': val,
-                                        'expires_at': float(expires)
-                                    }
-                            else:
-                                data[key] = {'value': value}
-            except Exception:
-                return {}
-            return data
-
-    def save(self) -> None:
-        """Сохраняет текущие данные в файл."""
-        with self.lock:
-            with open(self.filename, 'w', encoding='utf-8') as f:
-                for key, entry in self.data.items():
-                    value = entry['value']
-                    if 'expires_at' in entry:
-                        value = f"{value}||{entry['expires_at']}"
-                    f.write(f"{key}={value}\n")
-
-    def set(self, key: str, value: str, ttl: Optional[int] = None) -> None:
-        """
-        Устанавливает значение по ключу.
+        # Кеш часто используемых значений
+        self._hot_keys = SortedList(key=lambda x: (-x[1], x[0]))  # (key, hits)
+        self._value_cache = {}  # Кеш для часто используемых значений
         
-        Args:
-            key (str): Ключ
-            value (str): Значение
-            ttl (Optional[int]): Время жизни в секундах
-        """
-        with self.lock:
-            entry = {'value': str(value)}
-            if ttl is not None:
-                entry['expires_at'] = datetime.now().timestamp() + ttl
-            self.data[key] = entry
-            self.save()
+        # Оптимизация блокировок
+        self._locks = defaultdict(RLock)  # Более гранулярные блокировки
+        self._global_lock = RLock()
+        
+        # Буферы для batch операций
+        self._write_buffer = deque(maxlen=1000)
+        self._read_buffer = {}
+        
+        # Остальные атрибуты...
+        self._ttl = SortedDict()  # Для быстрого поиска истекших ключей
+        self._optimize_level = optimize_level
+        
+        # Инициализация оптимизаций
+        self._setup_optimizations()
 
-    def get(self, key: str, default: Any = None) -> Optional[str]:
-        """
-        Возвращает значение по ключу.
-        """
-        with self.lock:
-            entry = self.data.get(key)
-            if entry is None:
+    def _setup_optimizations(self):
+        """Настройка оптимизаций в зависимости от уровня"""
+        if self._optimize_level >= 1:
+            # Базовые оптимизации
+            self._setup_key_prefetch()
+            self._setup_value_compression()
+            
+        if self._optimize_level >= 2:
+            # Продвинутые оптимизации
+            self._setup_hot_keys_tracking()
+            self._setup_adaptive_indexing()
+
+    @lru_cache(maxsize=1000)
+    def _get_lock(self, key: str) -> RLock:
+        """Получение блокировки для конкретного ключа"""
+        return self._locks[xxhash.xxh64(key.encode()).intdigest()]
+
+    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
+        """Оптимизированная установка значения"""
+        # Получаем блокировку для конкретного ключа
+        with self._get_lock(key):
+            # Буферизация записи
+            self._write_buffer.append(('set', key, value, ttl))
+            
+            # Если буфер полон, применяем все изменения
+            if len(self._write_buffer) >= self._write_buffer.maxlen:
+                self._flush_write_buffer()
+            
+            # Обновляем горячие ключи
+            self._update_hot_keys(key)
+            
+            # Быстрая установка значения
+            self._storage[key] = value
+            if ttl:
+                self._ttl[key] = time.time() + ttl
+                
+            return True
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Оптимизированное получение значения"""
+        # Проверяем кеш горячих ключей
+        if key in self._value_cache:
+            return self._value_cache[key]
+
+        with self._get_lock(key):
+            # Проверяем TTL
+            if key in self._ttl and time.time() > self._ttl[key]:
+                self._remove_expired_key(key)
                 return default
 
-            if 'expires_at' in entry:
-                if datetime.now().timestamp() > entry['expires_at']:
-                    self.delete(key)
-                    return default
-
-            return entry['value']
-
-    def delete(self, key: str) -> None:
-        """Удаляет значение по ключу."""
-        with self.lock:
-            self.data.pop(key, None)
-            self.save()
-
-    def exists(self, key: str) -> bool:
-        """Проверяет, существует ли ключ."""
-        entry = self.data.get(key)
-        if not entry:
-            return False
+            # Получаем значение
+            value = self._storage.get(key, default)
             
-        if 'expires_at' in entry:
-            if datetime.now().timestamp() > entry['expires_at']:
-                self.delete(key)
-                return False
-        return True
+            # Обновляем статистику использования
+            self._update_hot_keys(key)
+            
+            # Кешируем часто используемые значения
+            if self._is_hot_key(key):
+                self._value_cache[key] = value
+                
+            return value
 
-    def keys(self) -> List[str]:
-        """Возвращает список всех действительных ключей."""
-        return [key for key in self.data.keys() if self.exists(key)]
+    def _update_hot_keys(self, key: str) -> None:
+        """Обновление статистики горячих ключей"""
+        for idx, (k, hits) in enumerate(self._hot_keys):
+            if k == key:
+                self._hot_keys.pop(idx)
+                self._hot_keys.add((key, hits + 1))
+                return
+        self._hot_keys.add((key, 1))
 
-    def clear(self) -> None:
-        """Удаляет все данные."""
-        with self.lock:
-            self.data.clear()
-            self.save()
+    def _is_hot_key(self, key: str) -> bool:
+        """Проверка, является ли ключ горячим"""
+        return any(k == key and h > 100 for k, h in self._hot_keys)
 
-    def cleanup_expired(self) -> int:
-        """
-        Очищает просроченные записи.
+    def _flush_write_buffer(self) -> None:
+        """Применение буферизированных записей"""
+        with self._global_lock:
+            while self._write_buffer:
+                op, *args = self._write_buffer.popleft()
+                if op == 'set':
+                    key, value, ttl = args
+                    self._storage[key] = value
+                    if ttl:
+                        self._ttl[key] = time.time() + ttl
+
+    def _remove_expired_key(self, key: str) -> None:
+        """Оптимизированное удаление истекшего ключа"""
+        self._storage.pop(key, None)
+        self._ttl.pop(key, None)
+        self._value_cache.pop(key, None)
         
-        Returns:
-            int: Количество удаленных записей
-        """
-        with self.lock:
-            current_time = datetime.now().timestamp()
-            expired_keys = [
-                key for key, entry in self.data.items()
-                if 'expires_at' in entry and current_time > entry['expires_at']
-            ]
-            
-            for key in expired_keys:
-                del self.data[key]
-            
-            if expired_keys:
-                self.save()
-            
-            return len(expired_keys)
+        # Удаляем из индексов
+        for index in self._reverse_indexes.get(key, set()):
+            self._indexes[index].pop(key, None)
+        self._reverse_indexes.pop(key, None)
 
-    def update(self, other_data: Dict[str, str]) -> None:
-        """
-        Обновляет несколько значений одновременно.
+    # Оптимизированные операции со списками
+    def lpush(self, key: str, *values: Any) -> int:
+        """Оптимизированное добавление в начало списка"""
+        with self._get_lock(key):
+            dq = self._lists[key]
+            dq.extendleft(reversed(values))  # O(1) для каждого элемента
+            return len(dq)
+
+    def rpush(self, key: str, *values: Any) -> int:
+        """Оптимизированное добавление в конец списка"""
+        with self._get_lock(key):
+            dq = self._lists[key]
+            dq.extend(values)  # O(1) для каждого элемента
+            return len(dq)
+
+    # Оптимизированные операции с множествами
+    def sadd(self, key: str, *members: Any) -> int:
+        """Оптимизированное добавление в множество"""
+        with self._get_lock(key):
+            optimized_set = self._sets[key]
+            original_size = len(optimized_set._data)
+            for member in members:
+                optimized_set.add(member)
+            return len(optimized_set._data) - original_size
+
+    def srem(self, key: str, *members: Any) -> int:
+        """Оптимизированное удаление из множества"""
+        with self._get_lock(key):
+            optimized_set = self._sets[key]
+            original_size = len(optimized_set._data)
+            for member in members:
+                optimized_set.remove(member)
+            return original_size - len(optimized_set._data)
+
+    # Оптимизированный поиск
+    def search_by_index(self, index_name: str, value: Any) -> Set[str]:
+        """Оптимизированный поиск по индексу"""
+        # Используем быстрый хеш для поиска
+        index = self._indexes[index_name]
+        value_hash = xxhash.xxh64(str(value).encode()).intdigest()
         
-        Args:
-            other_data (Dict[str, str]): Словарь с новыми данными
-        """
-        with self.lock:
-            for key, value in other_data.items():
-                self.set(key, value)
+        # Используем бинарный поиск
+        start_idx = index.bisect_left(value_hash)
+        end_idx = index.bisect_right(value_hash)
+        
+        return set(index.values()[start_idx:end_idx])
 
-    @contextmanager
-    def auto_clear(self):
-        """Контекстный менеджер для автоматической очистки памяти при выходе."""
+    # Оптимизированная сериализация
+    def serialize(self, value: Any, format: str = 'msgpack') -> bytes:
+        """Оптимизированная сериализация"""
+        if format == 'msgpack':
+            return msgpack.packb(value, use_bin_type=True)
+        elif format == 'json':
+            return ujson.dumps(value).encode()
+        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def deserialize(self, value: bytes, format: str = 'msgpack') -> Any:
+        """Оптимизированная десериализация"""
+        if format == 'msgpack':
+            return msgpack.unpackb(value, raw=False)
+        elif format == 'json':
+            return ujson.loads(value.decode())
+        return pickle.loads(value)
+
+    # Оптимизированное сжатие
+    def compress_value(self, value: Any) -> bytes:
+        """Оптимизированное сжатие значения"""
+        serialized = self.serialize(value)
+        if len(serialized) > 1024:  # Сжимаем только большие значения
+            return zlib.compress(serialized, level=1)  # Используем быстрое сжатие
+        return serialized
+
+    def decompress_value(self, value: bytes) -> Any:
+        """Оптимизированная распаковка значения"""
         try:
-            yield self
-        finally:
-            self.clear()
+            # Проверяем, сжаты ли данные
+            if value.startswith(b'x\x9c'):  # Маркер сжатых данных zlib
+                value = zlib.decompress(value)
+            return self.deserialize(value)
+        except Exception:
+            return value
+
+    # Оптимизированная очистка
+    def _cleanup_expired(self) -> None:
+        """Оптимизированная очистка устаревших данных"""
+        current_time = time.time()
+        
+        # Используем бинарный поиск для нахождения истекших ключей
+        expired_keys = []
+        for key, expire_time in self._ttl.items():
+            if expire_time <= current_time:
+                expired_keys.append(key)
+            else:
+                break  # Благодаря сортировке можем остановиться
+                
+        # Пакетное удаление
+        if expired_keys:
+            with self._global_lock:
+                for key in expired_keys:
+                    self._remove_expired_key(key)
